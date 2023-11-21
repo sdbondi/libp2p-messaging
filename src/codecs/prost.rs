@@ -1,7 +1,6 @@
 use crate::codec::Codec;
-use crate::Message;
 use async_trait::async_trait;
-use libp2p::futures::{AsyncRead, AsyncReadExt, AsyncWrite};
+use libp2p::futures::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use libp2p::StreamProtocol;
 use std::fmt;
 use std::marker::PhantomData;
@@ -21,14 +20,9 @@ impl<TMsg> Codec for ProstCodec<TMsg>
 where
     TMsg: prost::Message + Default,
 {
-    type Protocol = StreamProtocol;
     type Message = TMsg;
 
-    async fn decode_from<R>(
-        &mut self,
-        protocol: &Self::Protocol,
-        reader: &mut R,
-    ) -> std::io::Result<Message<Self>>
+    async fn decode_from<R>(&mut self, reader: &mut R) -> std::io::Result<Self::Message>
     where
         R: AsyncRead + Unpin + Send,
     {
@@ -47,28 +41,33 @@ where
         let message = prost::Message::decode(&mut slice)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
 
-        if slice.is_empty() {
+        if !slice.is_empty() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::Other,
-                "bytes remaining in buffer",
+                "bytes remaining on buffer",
             ));
         }
-        Ok(Message {
-            message,
-            protocol: protocol.clone(),
-        })
+        Ok(message)
     }
 
-    async fn encode_to<W>(
-        &mut self,
-        protocol: &Self::Protocol,
-        writer: &mut W,
-        message: Self::Message,
-    ) -> std::io::Result<()>
+    async fn encode_to<W>(&mut self, writer: &mut W, message: Self::Message) -> std::io::Result<()>
     where
         W: AsyncWrite + Unpin + Send,
     {
-        todo!()
+        let mut buf = Vec::new();
+        message
+            .encode(&mut buf)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        let len = buf.len();
+        if len > MAX_MESSAGE_SIZE {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "message too large",
+            ));
+        }
+        writer.write_all(&(len as u32).to_be_bytes()).await?;
+        writer.write_all(&buf).await?;
+        Ok(())
     }
 }
 

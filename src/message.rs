@@ -1,16 +1,10 @@
-use crate::codec::Codec;
-use std::fmt;
+use libp2p::PeerId;
 
-pub struct Message<TCodec: Codec> {
-    pub(crate) message: TCodec::Message,
-    pub(crate) protocol: TCodec::Protocol,
-}
+pub type MessageId = u64;
 
-impl<TCodec> fmt::Debug for Message<TCodec>
-where
-    TCodec: Codec,
-{
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Message").finish_non_exhaustive()
-    }
+#[derive(Debug, Clone)]
+pub struct OutboundMessage<TMsg> {
+    pub peer_id: PeerId,
+    pub message: TMsg,
+    pub message_id: MessageId,
 }

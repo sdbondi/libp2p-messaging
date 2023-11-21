@@ -1,15 +1,25 @@
-use crate::codec::Codec;
 use crate::error::Error;
-use crate::Message;
-use libp2p::bytes::Bytes;
+use crate::MessageId;
 use libp2p::PeerId;
 
 #[derive(Debug)]
-pub enum Event<TCodec: Codec> {
+pub enum Event<TMsg> {
     ReceivedMessage {
         peer_id: PeerId,
-        message: Message<TCodec>,
+        message: TMsg,
+    },
+    MessageSent {
+        message_id: MessageId,
+    },
+    InboundFailure {
+        peer_id: PeerId,
+        message_id: MessageId,
+        error: Error,
+    },
+    OutboundFailure {
+        peer_id: PeerId,
+        message_id: MessageId,
+        error: Error,
     },
     Error(Error),
 }
-

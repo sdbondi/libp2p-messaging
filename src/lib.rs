@@ -9,4 +9,5 @@ mod message;
 
 pub use behaviour::*;
 pub use config::*;
+pub use event::*;
 pub use message::*;
