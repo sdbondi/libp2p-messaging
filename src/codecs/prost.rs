@@ -1,7 +1,6 @@
 use crate::codec::Codec;
 use async_trait::async_trait;
 use libp2p::futures::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use libp2p::StreamProtocol;
 use std::fmt;
 use std::marker::PhantomData;
 
