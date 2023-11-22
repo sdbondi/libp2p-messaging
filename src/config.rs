@@ -4,6 +4,7 @@ use std::time::Duration;
 pub struct Config {
     pub max_concurrent_streams: usize,
     pub send_recv_timeout: Duration,
+    pub inbound_message_buffer_size: usize,
 }
 
 impl Default for Config {
@@ -11,6 +12,7 @@ impl Default for Config {
         Self {
             max_concurrent_streams: 3,
             send_recv_timeout: Duration::from_secs(10),
+            inbound_message_buffer_size: 10,
         }
     }
 }

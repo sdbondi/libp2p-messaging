@@ -2,7 +2,8 @@ use crate::codec::Codec;
 use crate::error::Error;
 use crate::event::Event;
 use crate::handler::Handler;
-use crate::{Config, MessageId, OutboundMessage};
+use crate::stream::{MessageSink, MessageStream, StreamId};
+use crate::{stream, Config, MessageId, OutboundMessage};
 use libp2p::core::Endpoint;
 use libp2p::swarm::dial_opts::DialOpts;
 use libp2p::swarm::{
@@ -29,11 +30,11 @@ where
     protocol: StreamProtocol,
     config: Config,
     pending_events: VecDeque<ToSwarm<Event<TCodec::Message>, THandlerInEvent<Self>>>,
-    pending_outbound_messages: HashMap<PeerId, SmallVec<OutboundMessage<TCodec::Message>, 10>>,
     /// The currently connected peers, their pending outbound and inbound responses and their known,
     /// reachable addresses, if any.
     connected: HashMap<PeerId, SmallVec<Connection, 2>>,
-    next_outbound_message_id: MessageId,
+    pending_outbound_streams: HashMap<PeerId, SmallVec<MessageStream<TCodec::Message>, 10>>,
+    next_outbound_stream_id: StreamId,
 }
 
 impl<TCodec> Behaviour<TCodec>
@@ -45,57 +46,55 @@ where
             protocol,
             config,
             pending_events: VecDeque::new(),
-            pending_outbound_messages: HashMap::new(),
+            pending_outbound_streams: HashMap::new(),
             connected: HashMap::new(),
-            next_outbound_message_id: 0,
+            next_outbound_stream_id: StreamId::default(),
         }
     }
 
-    pub fn send_message(&mut self, peer_id: PeerId, message: TCodec::Message) {
-        let message_id = self.next_outbound_message_id();
-        let message = OutboundMessage {
-            peer_id,
-            message_id,
-            message,
-        };
-
-        if let Some(message) = self.try_send_request(message) {
-            self.pending_events.push_back(ToSwarm::Dial {
-                opts: DialOpts::peer_id(peer_id).build(),
-            });
-            self.pending_outbound_messages
-                .entry(peer_id)
-                .or_default()
-                .push(message);
-        }
-    }
-
-    fn next_outbound_message_id(&mut self) -> MessageId {
-        let request_id = self.next_outbound_message_id;
-        self.next_outbound_message_id = self.next_outbound_message_id.wrapping_add(1);
-        request_id
-    }
-
-    fn try_send_request(
+    pub async fn enqueue_message(
         &mut self,
-        message: OutboundMessage<TCodec::Message>,
-    ) -> Option<OutboundMessage<TCodec::Message>> {
-        if let Some(connections) = self.connected.get_mut(&message.peer_id) {
-            if connections.is_empty() {
-                return Some(message);
+        peer_id: PeerId,
+        message: TCodec::Message,
+    ) -> Result<(), Error> {
+        self.open_message_channel(peer_id).send(message).await?;
+        Ok(())
+    }
+
+    pub fn open_message_channel(&mut self, peer_id: PeerId) -> MessageSink<TCodec::Message> {
+        let stream_id = self.next_outbound_stream_id();
+        let (sink, stream) = stream::channel(stream_id, peer_id, 10);
+
+        match self.get_connections(&peer_id) {
+            Some(connections) => {
+                let ix = (stream_id as usize) % connections.len();
+                let conn = &mut connections[ix];
+                conn.pending_streams.insert(stream_id);
+                let conn_id = conn.id;
+                self.pending_events.push_back(ToSwarm::NotifyHandler {
+                    peer_id,
+                    handler: NotifyHandler::One(conn_id),
+                    event: stream,
+                });
             }
-            let ix = (message.message_id as usize) % connections.len();
-            let conn = &mut connections[ix];
-            conn.pending_messages.insert(message.message_id);
-            self.pending_events.push_back(ToSwarm::NotifyHandler {
-                peer_id: message.peer_id,
-                handler: NotifyHandler::One(conn.id),
-                event: message,
-            });
-            None
-        } else {
-            Some(message)
+            None => {
+                self.pending_events.push_back(ToSwarm::Dial {
+                    opts: DialOpts::peer_id(peer_id).build(),
+                });
+                self.pending_outbound_streams
+                    .entry(peer_id)
+                    .or_default()
+                    .push(stream);
+            }
         }
+
+        sink
+    }
+
+    fn next_outbound_stream_id(&mut self) -> MessageId {
+        let request_id = self.next_outbound_stream_id;
+        self.next_outbound_stream_id = self.next_outbound_stream_id.wrapping_add(1);
+        request_id
     }
 
     fn on_connection_closed(
@@ -123,11 +122,11 @@ where
             self.connected.remove(&peer_id);
         }
 
-        for message_id in connection.pending_messages {
+        for stream_id in connection.pending_streams {
             self.pending_events
                 .push_back(ToSwarm::GenerateEvent(Event::InboundFailure {
                     peer_id,
-                    message_id,
+                    stream_id,
                     error: Error::ConnectionClosed,
                 }));
         }
@@ -158,12 +157,12 @@ where
             // only created when a peer is not connected when a request is made.
             // Thus these requests must be considered failed, even if there is
             // another, concurrent dialing attempt ongoing.
-            if let Some(pending) = self.pending_outbound_messages.remove(&peer) {
-                for request in pending {
+            if let Some(pending) = self.pending_outbound_streams.remove(&peer) {
+                for stream in pending {
                     self.pending_events
                         .push_back(ToSwarm::GenerateEvent(Event::OutboundFailure {
                             peer_id: peer,
-                            message_id: request.message_id,
+                            stream_id: stream.stream_id(),
                             error: Error::DialFailure,
                         }));
                 }
@@ -180,14 +179,18 @@ where
     ) {
         let mut connection = Connection::new(connection_id, remote_address);
 
-        if let Some(pending_messages) = self.pending_outbound_messages.remove(&peer_id) {
-            for message in pending_messages {
-                connection.pending_messages.insert(message.message_id);
-                handler.on_behaviour_event(message);
+        if let Some(pending_streams) = self.pending_outbound_streams.remove(&peer_id) {
+            for stream in pending_streams {
+                connection.pending_streams.insert(stream.stream_id());
+                handler.on_behaviour_event(stream);
             }
         }
 
         self.connected.entry(peer_id).or_default().push(connection);
+    }
+
+    fn get_connections(&mut self, peer_id: &PeerId) -> Option<&mut SmallVec<Connection, 2>> {
+        self.connected.get_mut(peer_id).filter(|c| !c.is_empty())
     }
 }
 
@@ -272,7 +275,7 @@ where
 struct Connection {
     id: ConnectionId,
     remote_address: Option<Multiaddr>,
-    pending_messages: HashSet<MessageId>,
+    pending_streams: HashSet<MessageId>,
 }
 
 impl Connection {
@@ -280,7 +283,7 @@ impl Connection {
         Self {
             id,
             remote_address,
-            pending_messages: HashSet::new(),
+            pending_streams: HashSet::new(),
         }
     }
 }

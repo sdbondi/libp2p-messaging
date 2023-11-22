@@ -1,9 +1,11 @@
 use crate::codec::Codec;
 use crate::error::Error;
 use crate::event::Event;
-use crate::{Config, OutboundMessage, EMPTY_QUEUE_SHRINK_THRESHOLD};
+use crate::stream::MessageStream;
+use crate::{Config, MessageId, EMPTY_QUEUE_SHRINK_THRESHOLD};
 use libp2p::core::UpgradeInfo;
-use libp2p::futures::FutureExt;
+use libp2p::futures::channel::mpsc;
+use libp2p::futures::{FutureExt, SinkExt, StreamExt};
 use libp2p::swarm::handler::{
     ConnectionEvent, DialUpgradeError, FullyNegotiatedInbound, FullyNegotiatedOutbound,
     ListenUpgradeError,
@@ -15,29 +17,37 @@ use libp2p::{InboundUpgrade, OutboundUpgrade, PeerId, Stream, StreamProtocol};
 use std::collections::VecDeque;
 use std::convert::Infallible;
 use std::future::{ready, Ready};
+use std::io;
 use std::task::{Context, Poll};
+use std::time::Duration;
 
 pub struct Handler<TCodec: Codec> {
     peer_id: PeerId,
     protocol: StreamProtocol,
-    requested_outbound: VecDeque<OutboundMessage<TCodec::Message>>,
-    pending_outbound: VecDeque<OutboundMessage<TCodec::Message>>,
+    requested_streams: VecDeque<MessageStream<TCodec::Message>>,
+    pending_streams: VecDeque<MessageStream<TCodec::Message>>,
     pending_events: VecDeque<Event<TCodec::Message>>,
+    pending_events_sender: mpsc::Sender<Event<TCodec::Message>>,
+    pending_events_receiver: mpsc::Receiver<Event<TCodec::Message>>,
     codec: TCodec,
     tasks: futures_bounded::FuturesSet<Event<TCodec::Message>>,
 }
 
 impl<TCodec: Codec> Handler<TCodec> {
     pub fn new(peer_id: PeerId, protocol: StreamProtocol, config: &Config) -> Self {
+        let (pending_events_sender, pending_events_receiver) =
+            mpsc::channel(config.max_concurrent_streams);
         Self {
             peer_id,
             protocol,
-            requested_outbound: VecDeque::new(),
-            pending_outbound: VecDeque::new(),
+            requested_streams: VecDeque::new(),
+            pending_streams: VecDeque::new(),
             pending_events: VecDeque::new(),
             codec: TCodec::default(),
+            pending_events_sender,
+            pending_events_receiver,
             tasks: futures_bounded::FuturesSet::new(
-                config.send_recv_timeout,
+                Duration::from_secs(10000 * 24 * 60 * 60),
                 config.max_concurrent_streams,
             ),
         }
@@ -53,8 +63,8 @@ where
     }
 
     fn on_dial_upgrade_error(&mut self, error: DialUpgradeError<(), Protocol<StreamProtocol>>) {
-        let message = self
-            .requested_outbound
+        let stream = self
+            .requested_streams
             .pop_front()
             .expect("negotiated a stream without a pending message");
 
@@ -62,7 +72,7 @@ where
             StreamUpgradeError::Timeout => {
                 self.pending_events.push_back(Event::OutboundFailure {
                     peer_id: self.peer_id,
-                    message_id: message.message_id,
+                    stream_id: stream.stream_id(),
                     error: Error::DialUpgradeError,
                 });
             }
@@ -74,7 +84,7 @@ where
                 // the remote peer does not support the requested protocol(s).
                 self.pending_events.push_back(Event::OutboundFailure {
                     peer_id: self.peer_id,
-                    message_id: message.message_id,
+                    stream_id: stream.stream_id(),
                     error: Error::ProtocolNotSupported,
                 });
             }
@@ -82,9 +92,9 @@ where
             StreamUpgradeError::Io(e) => {
                 tracing::debug!(
                     "outbound stream for request {} failed: {e}, retrying",
-                    message.message_id
+                    stream.stream_id()
                 );
-                self.requested_outbound.push_back(message);
+                self.requested_streams.push_back(stream);
             }
         }
     }
@@ -94,19 +104,43 @@ where
         outbound: FullyNegotiatedOutbound<Protocol<StreamProtocol>, ()>,
     ) {
         let mut codec = self.codec.clone();
-        let (mut stream, _protocol) = outbound.protocol;
+        let (mut peer_stream, _protocol) = outbound.protocol;
 
-        let message = self
-            .requested_outbound
+        let mut msg_stream = self
+            .requested_streams
             .pop_front()
             .expect("negotiated a stream without a pending message");
 
+        let mut events = self.pending_events_sender.clone();
+
         let fut = async move {
-            match codec.encode_to(&mut stream, message.message).await {
-                Ok(_) => Event::MessageSent {
-                    message_id: message.message_id,
-                },
-                Err(e) => Event::Error(Error::DecodeError(e)),
+            let mut message_id = MessageId::default();
+            let stream_id = msg_stream.stream_id();
+            let peer_id = *msg_stream.peer_id();
+            loop {
+                let Some(msg) = msg_stream.recv().await else {
+                    break Event::StreamClosed { peer_id, stream_id };
+                };
+                eprintln!("--------------> DEBUG: sending on stream: {stream_id}");
+
+                match codec.encode_to(&mut peer_stream, msg).await {
+                    Ok(()) => {
+                        events
+                            .send(Event::MessageSent {
+                                message_id,
+                                stream_id,
+                            })
+                            .await
+                            .expect(
+                                "Can never be closed because receiver is held in this instance",
+                            );
+                    }
+                    Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
+                        break Event::StreamClosed { peer_id, stream_id };
+                    }
+                    Err(e) => break Event::Error(Error::CodecError(e)),
+                }
+                message_id = message_id.wrapping_add(1);
             }
         }
         .boxed();
@@ -123,11 +157,31 @@ where
         let mut codec = self.codec.clone();
         let peer_id = self.peer_id;
         let (mut stream, _protocol) = inbound.protocol;
+        let mut events = self.pending_events_sender.clone();
 
         let fut = async move {
-            match codec.decode_from(&mut stream).await {
-                Ok(message) => Event::ReceivedMessage { peer_id, message },
-                Err(e) => Event::Error(Error::DecodeError(e)),
+            loop {
+                match codec.decode_from(&mut stream).await {
+                    Ok(msg) => {
+                        events
+                            .send(Event::ReceivedMessage {
+                                peer_id,
+                                message: msg,
+                            })
+                            .await
+                            .expect(
+                                "Can never be closed because receiver is held in this instance",
+                            );
+                        // TODO
+                        // Event::ReceivedMessage { peer_id, message }
+                    }
+                    Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
+                        break Event::InboundStreamClosed { peer_id };
+                    }
+                    Err(e) => {
+                        break Event::Error(Error::CodecError(e));
+                    }
+                }
             }
         }
         .boxed();
@@ -142,7 +196,7 @@ impl<TCodec> ConnectionHandler for Handler<TCodec>
 where
     TCodec: Codec + Send + Clone + 'static,
 {
-    type FromBehaviour = OutboundMessage<TCodec::Message>;
+    type FromBehaviour = MessageStream<TCodec::Message>;
     type ToBehaviour = Event<TCodec::Message>;
     type InboundProtocol = Protocol<StreamProtocol>;
     type OutboundProtocol = Protocol<StreamProtocol>;
@@ -176,45 +230,39 @@ where
             Poll::Pending => {}
         }
 
-        // Drain pending events that were produced by `worker_streams`.
+        // Drain pending events that were produced by handler
         if let Some(event) = self.pending_events.pop_front() {
             return Poll::Ready(ConnectionHandlerEvent::NotifyBehaviour(event));
         } else if self.pending_events.capacity() > EMPTY_QUEUE_SHRINK_THRESHOLD {
             self.pending_events.shrink_to_fit();
         }
 
-        // // Check for inbound requests.
-        // if let Poll::Ready(Some((id, rq, rs_sender))) = self.inbound_receiver.poll_next_unpin(cx) {
-        //     // We received an inbound request.
-        //
-        //     return Poll::Ready(ConnectionHandlerEvent::NotifyBehaviour(Event::Request {
-        //         request_id: id,
-        //         request: rq,
-        //         sender: rs_sender,
-        //     }));
-        // }
+        // Emit pending events produced by handler tasks
+        if let Poll::Ready(Some(event)) = self.pending_events_receiver.poll_next_unpin(cx) {
+            return Poll::Ready(ConnectionHandlerEvent::NotifyBehaviour(event));
+        }
 
-        // Emit outbound requests.
-        if let Some(message) = self.pending_outbound.pop_front() {
+        // Emit outbound streams.
+        if let Some(stream) = self.pending_streams.pop_front() {
             let protocol = self.protocol.clone();
-            self.requested_outbound.push_back(message);
+            self.requested_streams.push_back(stream);
 
             return Poll::Ready(ConnectionHandlerEvent::OutboundSubstreamRequest {
                 protocol: SubstreamProtocol::new(Protocol { protocol }, ()),
             });
         }
 
-        debug_assert!(self.pending_outbound.is_empty());
+        debug_assert!(self.pending_streams.is_empty());
 
-        if self.pending_outbound.capacity() > EMPTY_QUEUE_SHRINK_THRESHOLD {
-            self.pending_outbound.shrink_to_fit();
+        if self.pending_streams.capacity() > EMPTY_QUEUE_SHRINK_THRESHOLD {
+            self.pending_streams.shrink_to_fit();
         }
 
         Poll::Pending
     }
 
-    fn on_behaviour_event(&mut self, msg: Self::FromBehaviour) {
-        self.pending_outbound.push_back(msg);
+    fn on_behaviour_event(&mut self, stream: Self::FromBehaviour) {
+        self.pending_streams.push_back(stream);
     }
 
     fn on_connection_event(
