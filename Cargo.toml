@@ -7,7 +7,7 @@ edition = "2021"
 libp2p = "0.53.1"
 
 async-trait = "0.1.74"
-prost = { version = "0.12", optional = true }
+prost = { version = ">=0.9", optional = true }
 smallvec = "2.0.0-alpha.1"
 futures-bounded = "0.2.3"
 tracing = "0.1.40"
