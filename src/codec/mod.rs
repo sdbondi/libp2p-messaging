@@ -1,3 +1,6 @@
+#[cfg(feature = "prost")]
+pub mod prost;
+
 use libp2p::futures::{AsyncRead, AsyncWrite};
 use std::{fmt, io};
 
