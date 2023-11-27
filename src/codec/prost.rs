@@ -4,6 +4,9 @@ use libp2p::futures::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use std::fmt;
 use std::marker::PhantomData;
 
+// Re-export prost public types
+pub use ::prost::Message;
+
 const MAX_MESSAGE_SIZE: usize = 4 * 1024 * 1024;
 
 pub struct ProstCodec<TMsg>(PhantomData<TMsg>);
