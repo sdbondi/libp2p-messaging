@@ -4,7 +4,8 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-libp2p = "0.53.1"
+#libp2p = "0.53.1"
+libp2p = { git = "https://github.com/sdbondi/rust-libp2p.git",  rev = "a66659e3786b3fff1382e7e66b735d021636bf4f" }
 
 async-trait = "0.1.74"
 prost = { version = ">=0.9", optional = true }
